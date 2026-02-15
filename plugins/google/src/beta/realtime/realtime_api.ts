@@ -458,6 +458,14 @@ export class RealtimeSession extends llm.RealtimeSession {
           httpOptions,
         };
 
+    this.#logger.info({
+      vertexai,
+      project: vertexai ? project : undefined,
+      location: vertexai ? location : undefined,
+      apiKeyProvided: !vertexai ? !!apiKey : undefined,
+      apiVersion: httpOptions?.apiVersion,
+    }, 'GoogleGenAI client options');
+
     this.#client = new GoogleGenAI(clientOptions);
     this.#task = this.#mainTask();
   }
@@ -808,19 +816,37 @@ export class RealtimeSession extends llm.RealtimeSession {
 
       try {
         this.#logger.debug('Connecting to Gemini Realtime API...');
+        this.#logger.info({
+          model: this.options.model,
+          vertexai: this.options.vertexai,
+          project: this.options.project,
+          location: this.options.location,
+          voice: this.options.voice,
+          apiKeyProvided: !!this.options.apiKey,
+          thinkingConfig: config.thinkingConfig,
+          responseModalities: config.responseModalities,
+        }, 'Gemini connection config');
 
         const sessionOpened = new Event();
         const session = await this.#client.live.connect({
           model: this.options.model,
           callbacks: {
-            onopen: () => sessionOpened.set(),
+            onopen: () => {
+              this.#logger.info('Gemini Live WebSocket opened successfully');
+              sessionOpened.set();
+            },
             onmessage: (message: types.LiveServerMessage) => {
               this.onReceiveMessage(session, message);
             },
             // onerror is called for network-level errors (connection refused, DNS failure, TLS errors).
             // Application-level errors (e.g., invalid model name) come through onclose with error codes.
             onerror: (error: ErrorEvent) => {
-              this.#logger.error('Gemini Live session error:', error);
+              this.#logger.error({
+                error,
+                errorType: error.type,
+                errorMessage: error.message,
+                errorStack: (error as any).stack,
+              }, 'Gemini Live WebSocket error event');
               if (!this.sessionShouldClose.isSet) {
                 this.markRestartNeeded();
               }
@@ -835,7 +861,15 @@ export class RealtimeSession extends llm.RealtimeSession {
                   ? ' (message may be truncated - check model name and API permissions)'
                   : '';
                 const errorMsg = event.reason || `WebSocket closed with code ${event.code}`;
-                this.#logger.error(`Gemini Live session error: ${errorMsg}${truncationNote}`);
+                this.#logger.error({
+                  code: event.code,
+                  reason: event.reason,
+                  wasClean: event.wasClean,
+                  isTruncated,
+                  model: this.options.model,
+                  vertexai: this.options.vertexai,
+                  apiKeyProvided: !!this.options.apiKey,
+                }, `Gemini Live WebSocket closed abnormally: ${errorMsg}${truncationNote}`);
 
                 this.emitError(
                   new APIStatusError({
