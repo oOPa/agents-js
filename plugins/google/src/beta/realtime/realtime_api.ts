@@ -416,6 +416,7 @@ export class RealtimeSession extends llm.RealtimeSession {
   private hasReceivedAudioInput = false;
   private pendingInterruptText = false;
   private earlyCompletionPending = false;
+  private lastEosTimestamp?: number;
 
   #client: GoogleGenAI;
   #task: Promise<void>;
@@ -1066,6 +1067,13 @@ export class RealtimeSession extends llm.RealtimeSession {
       unlock();
     }
 
+    if (response.voiceActivityDetectionSignal) {
+      const vadSignalType = response.voiceActivityDetectionSignal.vadSignalType;
+      if (vadSignalType === 'VAD_SIGNAL_TYPE_EOS') {
+        this.lastEosTimestamp = Date.now();
+      }
+    }
+
     const shouldStartNewGeneration =
       !this.currentGeneration || this.currentGeneration._done || !!this.pendingGenerationFut;
     if (shouldStartNewGeneration) {
@@ -1343,9 +1351,10 @@ export class RealtimeSession extends llm.RealtimeSession {
       audioChannel: stream.createStreamChannel<AudioFrame>(),
       inputTranscription: '',
       outputText: '',
-      _createdTimestamp: Date.now(),
+      _createdTimestamp: this.lastEosTimestamp ?? Date.now(),
       _done: false,
     };
+    this.lastEosTimestamp = undefined;
 
     // Close audio stream if audio output is not supported by the model
     if (!this._realtimeModel.capabilities.audioOutput) {
