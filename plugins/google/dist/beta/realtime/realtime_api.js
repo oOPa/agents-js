@@ -672,6 +672,7 @@ class RealtimeSession extends llm.RealtimeSession {
     }
     if (response.voiceActivityDetectionSignal) {
       const vadSignalType = response.voiceActivityDetectionSignal.vadSignalType;
+      this.#logger.info({ vadSignalType }, "VAD signal received from Gemini");
       if (vadSignalType === "VAD_SIGNAL_TYPE_EOS") {
         this.lastEosTimestamp = Date.now();
       }
@@ -882,6 +883,15 @@ class RealtimeSession extends llm.RealtimeSession {
       this.markCurrentGenerationDone();
     }
     const responseId = shortuuid("GR_");
+    const createdTimestamp = this.lastEosTimestamp ?? Date.now();
+    this.#logger.info(
+      {
+        responseId,
+        hadEosTimestamp: this.lastEosTimestamp !== void 0,
+        eosAge: this.lastEosTimestamp ? Date.now() - this.lastEosTimestamp : void 0
+      },
+      "startNewGeneration TTFT anchor"
+    );
     this.currentGeneration = {
       messageChannel: stream.createStreamChannel(),
       functionChannel: stream.createStreamChannel(),
@@ -891,7 +901,7 @@ class RealtimeSession extends llm.RealtimeSession {
       audioChannel: stream.createStreamChannel(),
       inputTranscription: "",
       outputText: "",
-      _createdTimestamp: this.lastEosTimestamp ?? Date.now(),
+      _createdTimestamp: createdTimestamp,
       _done: false
     };
     this.lastEosTimestamp = void 0;
