@@ -1590,8 +1590,8 @@ export class RealtimeSession extends llm.RealtimeSession {
         }),
       );
     }
-    // This closes message/text/audio/function streams so the consumer can continue.
-    this.markCurrentGenerationDone();
+    // Keep the function stream open until the generation finishes. Gemini Live can
+    // emit another toolCall event after receiving the first tool response.
   }
 
   private handleToolCallCancellation(cancellation: types.LiveServerToolCallCancellation): void {

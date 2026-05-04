@@ -2802,10 +2802,35 @@ export class AgentActivity implements RecognitionHooks {
       this.agentSession._toolItemsAdded([f]);
     };
 
+    const autoToolReplyGeneration = this.llm.capabilities.autoToolReplyGeneration;
+    const autoToolOutputSends: Promise<void>[] = [];
+    let autoToolOutputSendChain: Promise<void> = Promise.resolve();
+
     const onToolExecutionCompleted = (out: ToolExecutionOutput) => {
       if (out.toolCallOutput) {
         speechHandle._itemAdded([out.toolCallOutput]);
       }
+
+      if (!autoToolReplyGeneration || !out.toolCallOutput) {
+        return;
+      }
+
+      const sendPromise = autoToolOutputSendChain.then(async () => {
+        if (replyAbortController.signal.aborted || speechHandle.interrupted) {
+          return;
+        }
+
+        await this.sendRealtimeToolOutput({
+          toolOutput: {
+            output: [out],
+            firstToolStartedFuture: new Future<void>(),
+          },
+          speechHandle,
+          waitForSpeechDrain: false,
+        });
+      });
+      autoToolOutputSendChain = sendPromise.catch(() => undefined);
+      autoToolOutputSends.push(sendPromise);
     };
 
     const [executeToolsTask, toolOutput] = performToolExecutions({
@@ -2930,6 +2955,11 @@ export class AgentActivity implements RecognitionHooks {
       return;
     }
 
+    if (autoToolReplyGeneration) {
+      await Promise.all(autoToolOutputSends);
+      return;
+    }
+
     // important: no agent ouput should be used after this point
     const { maxToolSteps } = this.agentSession.sessionOptions;
     if (speechHandle.numSteps >= maxToolSteps) {
@@ -2940,54 +2970,14 @@ export class AgentActivity implements RecognitionHooks {
       return;
     }
 
-    const { functionToolsExecutedEvent, shouldGenerateToolReply, newAgentTask, ignoreTaskSwitch } =
-      this.summarizeToolExecutionOutput(toolOutput, speechHandle);
+    const { shouldGenerateToolReply, schedulingPaused } = await this.sendRealtimeToolOutput({
+      toolOutput,
+      speechHandle,
+      waitForSpeechDrain: true,
+    });
 
-    this.agentSession.emit(
-      AgentSessionEventTypes.FunctionToolsExecuted,
-      functionToolsExecutedEvent,
-    );
-
-    let schedulingPaused = this.schedulingPaused;
-    if (!ignoreTaskSwitch && newAgentTask !== null) {
-      this.agentSession.updateAgent(newAgentTask);
-      schedulingPaused = true;
-    }
-
-    if (functionToolsExecutedEvent.functionCallOutputs.length > 0) {
-      // wait all speeches played before updating the tool output and generating the response
-      // most realtime models dont support generating multiple responses at the same time
-      while (this.currentSpeech || this.speechQueue.size() > 0) {
-        if (
-          this.currentSpeech &&
-          !this.currentSpeech.done() &&
-          this.currentSpeech !== speechHandle
-        ) {
-          await this.currentSpeech.waitForPlayout();
-        } else {
-          // Don't block the event loop
-          await new ThrowsPromise<void, never>((resolve) => setImmediate(resolve));
-        }
-      }
-      const chatCtx = this.realtimeSession.chatCtx.copy();
-      chatCtx.items.push(...functionToolsExecutedEvent.functionCallOutputs);
-
-      this.agentSession._toolItemsAdded(
-        functionToolsExecutedEvent.functionCallOutputs as FunctionCallOutput[],
-      );
-
-      try {
-        await this.realtimeSession.updateChatCtx(chatCtx);
-      } catch (error) {
-        this.logger.warn(
-          { error },
-          'failed to update chat context before generating the function calls results',
-        );
-      }
-    }
-
-    // skip realtime reply if not required or auto-generated
-    if (!shouldGenerateToolReply || this.llm.capabilities.autoToolReplyGeneration) {
+    // skip realtime reply if not required
+    if (!shouldGenerateToolReply) {
       return;
     }
 
@@ -3067,6 +3057,75 @@ export class AgentActivity implements RecognitionHooks {
       newAgentTask,
       ignoreTaskSwitch,
     };
+  }
+
+  private async sendRealtimeToolOutput({
+    toolOutput,
+    speechHandle,
+    waitForSpeechDrain,
+  }: {
+    toolOutput: ToolOutput;
+    speechHandle: SpeechHandle;
+    waitForSpeechDrain: boolean;
+  }): Promise<{ shouldGenerateToolReply: boolean; schedulingPaused: boolean }> {
+    if (!this.realtimeSession) {
+      throw new Error('realtime session is not available');
+    }
+
+    const {
+      functionToolsExecutedEvent,
+      shouldGenerateToolReply,
+      newAgentTask,
+      ignoreTaskSwitch,
+    } = this.summarizeToolExecutionOutput(toolOutput, speechHandle);
+
+    this.agentSession.emit(
+      AgentSessionEventTypes.FunctionToolsExecuted,
+      functionToolsExecutedEvent,
+    );
+
+    let schedulingPaused = this.schedulingPaused;
+    if (!ignoreTaskSwitch && newAgentTask !== null) {
+      this.agentSession.updateAgent(newAgentTask);
+      schedulingPaused = true;
+    }
+
+    if (functionToolsExecutedEvent.functionCallOutputs.length > 0) {
+      if (waitForSpeechDrain) {
+        // wait all speeches played before updating the tool output and generating the response
+        // most realtime models dont support generating multiple responses at the same time
+        while (this.currentSpeech || this.speechQueue.size() > 0) {
+          if (
+            this.currentSpeech &&
+            !this.currentSpeech.done() &&
+            this.currentSpeech !== speechHandle
+          ) {
+            await this.currentSpeech.waitForPlayout();
+          } else {
+            // Don't block the event loop
+            await new ThrowsPromise<void, never>((resolve) => setImmediate(resolve));
+          }
+        }
+      }
+
+      const chatCtx = this.realtimeSession.chatCtx.copy();
+      chatCtx.items.push(...functionToolsExecutedEvent.functionCallOutputs);
+
+      this.agentSession._toolItemsAdded(
+        functionToolsExecutedEvent.functionCallOutputs as FunctionCallOutput[],
+      );
+
+      try {
+        await this.realtimeSession.updateChatCtx(chatCtx);
+      } catch (error) {
+        this.logger.warn(
+          { error },
+          'failed to update chat context before generating the function calls results',
+        );
+      }
+    }
+
+    return { shouldGenerateToolReply, schedulingPaused };
   }
 
   private async realtimeReplyTask({
