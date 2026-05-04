@@ -38,6 +38,7 @@ import type { LiveAPIModels, Voice } from './api_proto.js';
 // Input audio constants (matching Python)
 const INPUT_AUDIO_SAMPLE_RATE = 16000;
 const INPUT_AUDIO_CHANNELS = 1;
+const TOOL_RESPONSE_INPUT_SPEECH_SUPPRESSION_MS = 2_000;
 
 // Output audio constants (matching Python)
 const OUTPUT_AUDIO_SAMPLE_RATE = 24000;
@@ -392,6 +393,8 @@ export class RealtimeSession extends llm.RealtimeSession {
   private sessionLock = new Mutex();
   private numRetries = 0;
   private hasReceivedAudioInput = false;
+  private suppressAgentInitiatedInputSpeechUntil = 0;
+  private suppressedAgentInitiatedInputSpeech = false;
 
   #client: GoogleGenAI;
   #task: Promise<void>;
@@ -875,6 +878,7 @@ export class RealtimeSession extends llm.RealtimeSession {
             const { functionResponses } = msg.value;
             if (functionResponses) {
               this.#logger.debug(`(client) -> ${JSON.stringify(this.loggableClientEvent(msg))}`);
+              this.markToolResponseSent(functionResponses.length);
               await session.sendToolResponse({
                 functionResponses,
               });
@@ -1205,17 +1209,47 @@ export class RealtimeSession extends llm.RealtimeSession {
     } else {
       // emit input_speech_started event before starting an agent initiated generation
       // to interrupt the previous audio playout if any
-      this.handleInputSpeechStarted();
+      this.handleAgentInitiatedGenerationStarted();
     }
 
     this.emit('generation_created', generationEvent);
   }
 
+  private markToolResponseSent(functionResponseCount: number): void {
+    this.suppressAgentInitiatedInputSpeechUntil =
+      Date.now() + TOOL_RESPONSE_INPUT_SPEECH_SUPPRESSION_MS;
+    this.#logger.info(
+      {
+        functionResponseCount,
+        suppressionMs: TOOL_RESPONSE_INPUT_SPEECH_SUPPRESSION_MS,
+      },
+      'Suppressing synthetic input_speech_started after Gemini tool response',
+    );
+  }
+
+  private handleAgentInitiatedGenerationStarted(): void {
+    if (Date.now() < this.suppressAgentInitiatedInputSpeechUntil) {
+      this.suppressedAgentInitiatedInputSpeech = true;
+      this.#logger.info('Suppressed synthetic input_speech_started after Gemini tool response');
+      return;
+    }
+
+    this.suppressedAgentInitiatedInputSpeech = false;
+    this.handleInputSpeechStarted();
+  }
+
   private handleInputSpeechStarted(): void {
+    this.suppressedAgentInitiatedInputSpeech = false;
     this.emit('input_speech_started', {} as llm.InputSpeechStartedEvent);
   }
 
   private handleInputSpeechStopped(): void {
+    if (this.suppressedAgentInitiatedInputSpeech) {
+      this.suppressedAgentInitiatedInputSpeech = false;
+      this.#logger.info('Suppressed synthetic input_speech_stopped after Gemini tool response');
+      return;
+    }
+
     this.emit('input_speech_stopped', {
       userTranscriptionEnabled: false,
     } as llm.InputSpeechStoppedEvent);
@@ -1321,7 +1355,8 @@ export class RealtimeSession extends llm.RealtimeSession {
       } as llm.FunctionCall);
     }
 
-    this.markCurrentGenerationDone();
+    // Keep the function stream open until the generation finishes. Gemini Live can
+    // emit another toolCall event after receiving the first tool response.
   }
 
   private handleToolCallCancellation(cancellation: types.LiveServerToolCallCancellation): void {
